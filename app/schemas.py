@@ -39,3 +39,9 @@ class ConfirmCell(BaseModel):
 
 class ConfirmRequest(BaseModel):
     cells: list[ConfirmCell] = Field(min_length=3, max_length=6)
+
+
+class BatchCreate(BaseModel):
+    """交付批次登记：提交 2~4 个不重复的已确认组号。"""
+
+    group_ids: list[int] = Field(min_length=2, max_length=4)

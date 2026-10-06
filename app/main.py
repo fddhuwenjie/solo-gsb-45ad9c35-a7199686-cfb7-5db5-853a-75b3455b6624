@@ -17,6 +17,14 @@
 （db.read_snapshot，或直接用 LEFT JOIN 一条语句完成），杜绝"先读 cells 再读
 isolations"之间其他事务提交（确认、隔离）而拼出不存在的混合状态，例如
 occupied=false 同时 isolated=true。
+
+交付批次：把 2~4 个已确认组登记为可追溯的交付批次。建批在单事务内重查全部成员组
+（存在、同一化学体系、当前未被隔离阻断、尚未归属其他批次），全部通过才登记独占
+归属；任一组不满足即整批拒绝，不留部分归属。批次成员关系固定不可改写；查询返回
+各组确认时的检测快照，并按当前隔离记录给出整批可交付状态与受影响的组号、电芯 ID
+和原因。后续隔离会阻断已建批次，但不改写成员关系与原快照。建批与隔离走同一写路径
+（写锁 + BEGIN IMMEDIATE），并发时以提交先后决定是拒绝建批还是让已建批次转为
+阻断；批次查询在同一已提交快照内完成，不跨快照拼装。
 """
 from datetime import datetime, timezone
 
@@ -24,10 +32,13 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 
 from . import db
-from .schemas import CellCreate, ConfirmRequest, IsolateRequest, PreselectRequest, TestRevision
+from .schemas import (
+    BatchCreate, CellCreate, ConfirmRequest, IsolateRequest, PreselectRequest,
+    TestRevision,
+)
 from .selection import choose_group
 
-app = FastAPI(title="退役电芯成组放行 API", version="1.1.0")
+app = FastAPI(title="退役电芯成组放行 API", version="1.2.0")
 
 
 # 一次取出电芯档案与隔离标志：LEFT JOIN 单条语句天然共享同一读快照，
@@ -412,3 +423,136 @@ def get_group(group_id: int):
         if g is None:
             raise HTTPException(404, f"组 {group_id} 不存在")
         return _group_payload(conn, group_id)
+
+
+# ---------- 交付批次 ----------
+
+@app.post("/batches", status_code=201)
+def create_batch(body: BatchCreate):
+    """登记交付批次：单事务内重查全部成员组，全部通过才登记独占归属。
+
+    仅接收同一化学体系、当前未被隔离阻断且尚未归属其他批次的组；有组不存在、
+    已阻断或被另一批次先行占用 -> 整批拒绝、回滚，不产生批次也不留部分归属。
+    与隔离共用同一写路径：并发时以提交先后决定是拒绝建批还是让已建批次转为阻断。
+    """
+    ids = body.group_ids
+    if len(set(ids)) != len(ids):
+        raise HTTPException(422, "批次登记中存在重复组号")
+
+    conn = db.get_conn()
+    with db.write_lock:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            rows = conn.execute(
+                f"SELECT * FROM groups WHERE group_id IN ({','.join('?' * len(ids))})",
+                ids,
+            ).fetchall()
+            found = {r["group_id"]: r for r in rows}
+            missing = [i for i in ids if i not in found]
+            if missing:
+                raise HTTPException(409, f"组不存在，整批拒绝：{missing}")
+            taken = conn.execute(
+                f"SELECT group_id, batch_id FROM batch_groups"
+                f" WHERE group_id IN ({','.join('?' * len(ids))}) ORDER BY group_id",
+                ids,
+            ).fetchall()
+            if taken:
+                raise HTTPException(
+                    409,
+                    "组已归属其他批次，整批拒绝："
+                    + str([{r["group_id"]: r["batch_id"]} for r in taken]))
+            blocked = conn.execute(
+                f"SELECT DISTINCT gc.group_id FROM group_cells gc"
+                f" JOIN isolations i ON i.cell_id = gc.cell_id"
+                f" WHERE gc.group_id IN ({','.join('?' * len(ids))})"
+                f" ORDER BY gc.group_id",
+                ids,
+            ).fetchall()
+            if blocked:
+                raise HTTPException(
+                    409,
+                    "组当前被安全隔离阻断，整批拒绝："
+                    + str([r["group_id"] for r in blocked]))
+            chemistries = {found[i]["chemistry"] for i in ids}
+            if len(chemistries) != 1:
+                raise HTTPException(
+                    409, f"化学体系不一致，无法建批：{sorted(chemistries)}")
+
+            now = datetime.now(timezone.utc).isoformat()
+            cur = conn.execute(
+                "INSERT INTO batches (chemistry, created_at) VALUES (?, ?)",
+                (chemistries.pop(), now),
+            )
+            batch_id = cur.lastrowid
+            for i in ids:
+                conn.execute(
+                    "INSERT INTO batch_groups (batch_id, group_id) VALUES (?, ?)",
+                    (batch_id, i),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()  # 整批拒绝：不留下任何部分归属
+            raise
+    with db.read_snapshot(conn):
+        return _batch_payload(conn, batch_id)
+
+
+def _batch_payload(conn, batch_id: int) -> dict:
+    b = conn.execute("SELECT * FROM batches WHERE batch_id = ?", (batch_id,)).fetchone()
+    member_rows = conn.execute(
+        "SELECT group_id FROM batch_groups WHERE batch_id = ? ORDER BY group_id",
+        (batch_id,),
+    ).fetchall()
+    group_ids = [r["group_id"] for r in member_rows]
+    # 各组确认时的检测快照（含各组自身的当前阻断状态），成员关系固定不改写
+    groups = [_group_payload(conn, gid) for gid in group_ids]
+    # 受影响追溯：按当前隔离记录汇总整批阻断情况（不影响成员关系与原快照）
+    blocked_rows = conn.execute(
+        "SELECT gc.group_id, i.cell_id, i.reason, i.created_at"
+        " FROM batch_groups bg"
+        " JOIN group_cells gc ON gc.group_id = bg.group_id"
+        " JOIN isolations i ON i.cell_id = gc.cell_id"
+        " WHERE bg.batch_id = ?"
+        " ORDER BY gc.group_id, i.cell_id",
+        (batch_id,),
+    ).fetchall()
+    return {
+        "batch_id": b["batch_id"],
+        "chemistry": b["chemistry"],
+        "created_at": b["created_at"],
+        "group_ids": group_ids,  # 建批时登记的成员关系，之后固定不变
+        "deliverable": len(blocked_rows) == 0,  # False=整批阻断不可交付
+        "blocked_groups": [
+            {"group_id": r["group_id"], "cell_id": r["cell_id"],
+             "reason": r["reason"], "isolated_at": r["created_at"]}
+            for r in blocked_rows
+        ],
+        "groups": groups,
+    }
+
+
+@app.get("/batches")
+def list_batches():
+    """批次列表：同一已提交快照内的完整批次（建批事务未提交的批次不可见）。
+
+    每批附带固定成员关系、各组确认时的检测快照，以及按当前隔离记录判定的
+    整批可交付状态与受影响的组号、电芯 ID 和原因。
+    """
+    conn = db.get_conn()
+    with db.read_snapshot(conn):
+        rows = conn.execute("SELECT batch_id FROM batches ORDER BY batch_id").fetchall()
+        batches = [_batch_payload(conn, r["batch_id"]) for r in rows]
+    return {"count": len(batches), "batches": batches}
+
+
+@app.get("/batches/{batch_id}")
+def get_batch(batch_id: int):
+    """按批次号查询：固定成员关系、各组确认时的检测快照、按当前隔离记录判定的
+    整批可交付状态（未提交或已回滚的批次不可见；单次查询只反映同一已提交状态）。"""
+    conn = db.get_conn()
+    with db.read_snapshot(conn):
+        b = conn.execute(
+            "SELECT 1 FROM batches WHERE batch_id = ?", (batch_id,)).fetchone()
+        if b is None:
+            raise HTTPException(404, f"批次 {batch_id} 不存在")
+        return _batch_payload(conn, batch_id)

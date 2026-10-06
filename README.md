@@ -1,7 +1,8 @@
 # 退役电芯成组放行 API
 
 基于 FastAPI + SQLite 的退役电芯成组放行服务：录入待选电芯（最多 12 节），按串联成组
-约束预选最优组合，确认时在单个 SQLite 事务中原子占用整组并保存不可改写的检测快照。
+约束预选最优组合，确认时在单个 SQLite 事务中原子占用整组并保存不可改写的检测快照；
+已确认组可登记为 2~4 组的可追溯交付批次，批次按当前隔离记录判定整批是否可交付。
 
 ## 快速启动
 
@@ -50,6 +51,17 @@ python -m pytest tests/ -q
 - **快照不可改写**：`groups` / `group_cells` / `isolations` 表由触发器禁止
   UPDATE/DELETE，可按组编号 `GET /groups/{group_id}` 查询，后续检测修订与隔离
   不影响已确认组的快照内容。
+- **交付批次**：`POST /batches` 提交 2~4 个**不重复**的已确认组号，登记为可追溯的
+  交付批次。建批在**一次 SQLite 事务**（`BEGIN IMMEDIATE`）中重查全部成员组：仅接收
+  **同一化学体系、当前未被隔离阻断且尚未归属其他批次**的组；有组不存在、已阻断或被
+  另一批次先行占用，则**整批拒绝、回滚，不产生批次也不留部分归属**。批次成员关系
+  固定（`batches` / `batch_groups` 由触发器禁止 UPDATE/DELETE），每组在全库最多归属
+  一个批次（唯一约束兜底）。`GET /batches` / `GET /batches/{batch_id}` 返回固定成员
+  关系、各组**确认时的检测快照**，并按**当前隔离记录**给出整批 `deliverable` 与
+  受影响的组号、电芯 ID 和原因（`blocked_groups`）；后续隔离会阻断已建批次
+  （`deliverable: false`），但不改写成员关系与原快照。建批与隔离走同一写路径，
+  并发时以**提交先后**决定是拒绝建批（隔离先提交）还是让已建批次转为阻断
+  （建批先提交）；批次查询在同一已提交快照内完成，不会拼出跨快照状态。
 - **并发可见性**：每个请求使用各自线程的独立 SQLite 连接（WAL 模式），查询只能
   看到**已提交的完整快照**。确认/隔离事务提交前，其他请求看不到其中间状态；提交
   成功的瞬间整组（组记录 + 快照 + 占用）或隔离记录一次性可见，回滚则毫无痕迹。
@@ -76,6 +88,8 @@ python -m pytest tests/ -q
 | POST | `/preselect` | 预选成组（只读，排除已隔离电芯） |
 | POST | `/groups/confirm` | 确认候选（单事务重查版本/占用/隔离，原子占用 + 快照） |
 | GET | `/groups` / `/groups/{group_id}` | 查询已确认组：检测快照 + 当前阻断状态 |
+| POST | `/batches` | 登记交付批次（2~4 个不重复组号；单事务重查，独占归属） |
+| GET | `/batches` / `/batches/{batch_id}` | 查询批次：固定成员 + 各组检测快照 + 整批可交付状态 |
 
 ## 调用示例（curl）
 
@@ -307,14 +321,77 @@ kill $POLL
 之前"可控挂起读线程，再依次提交确认与隔离（见 `tests/test_api.py` 中
 `*_reads_one_committed_snapshot`）。
 
+### 9. 登记交付批次（2~4 个已确认组）
+
+```bash
+# 已有组 1、2（均为 LFP、当前未阻断、未归属其他批次）
+curl -s -X POST http://localhost:8000/batches \
+  -H 'Content-Type: application/json' \
+  -d '{"group_ids":[1,2]}'
+```
+
+成功返回 `201`：批次号、固定成员关系、各组确认时的检测快照与整批可交付状态：
+
+```json
+{
+  "batch_id": 1,
+  "chemistry": "LFP",
+  "created_at": "2026-10-06T03:00:00.000000+00:00",
+  "group_ids": [1, 2],
+  "deliverable": true,
+  "blocked_groups": [],
+  "groups": [
+    {"group_id": 1, "blocked": false, "blocked_cells": [],
+     "cells": [{"cell_id": "C001", "capacity": 100.0, "resistance": 2.1, "test_version": "T1"}]},
+    {"group_id": 2, "blocked": false, "blocked_cells": [], "cells": ["...确认时快照..."]}
+  ]
+}
+```
+
+整批拒绝的情形（`409`，不产生批次也不留部分归属）：组号不存在、组当前被隔离
+阻断、组已归属其他批次、成员组化学体系不一致；组号重复或数量不在 2~4 返回 `422`。
+
+### 10. 查询批次与隔离阻断
+
+```bash
+curl -s http://localhost:8000/batches/1
+```
+
+建批后若成员组内电芯被隔离，整批转为不可交付，并给出受影响的组号、电芯 ID 与
+原因；成员关系与各组原检测快照保持不变：
+
+```bash
+curl -s -X POST http://localhost:8000/cells/C005/isolate \
+  -H 'Content-Type: application/json' -d '{"reason":"巡检发现鼓包"}'
+curl -s http://localhost:8000/batches/1
+```
+
+```json
+{
+  "batch_id": 1,
+  "group_ids": [1, 2],
+  "deliverable": false,
+  "blocked_groups": [
+    {"group_id": 2, "cell_id": "C005", "reason": "巡检发现鼓包",
+     "isolated_at": "2026-10-06T03:30:00.000000+00:00"}
+  ],
+  "groups": ["...成员关系与各组确认时快照保持不变..."]
+}
+```
+
+建批与隔离并发时同样以**提交先后**决定结果：隔离先提交则建批整批拒绝（`409`，
+无批次、无部分归属）；建批先提交则批次产生并随即显示 `deliverable: false`。
+任何一次批次查询（`GET /batches` / `GET /batches/{batch_id}`）都在同一已提交
+快照内完成，`deliverable`、`blocked_groups` 与各组的 `blocked` 标记必然自洽。
+
 ## 项目结构
 
 ```
 app/
-  main.py       # FastAPI 路由：录入 / 复测 / 隔离 / 预选 / 确认 / 快照与阻断查询
+  main.py       # FastAPI 路由：录入 / 复测 / 隔离 / 预选 / 确认 / 快照与阻断查询 / 批次登记与查询
   db.py         # 每线程 SQLite 连接（WAL）、schema、不可改写触发器、写锁
   selection.py  # 成组预选算法（穷举组合，最多 C(12,6)=924 种）
-  schemas.py    # Pydantic 请求模型（串联节数 3~6、隔离原因等校验）
+  schemas.py    # Pydantic 请求模型（串联节数 3~6、隔离原因、批次 2~4 组等校验）
 tests/test_api.py
 Dockerfile / docker-compose.yml
 ```
