@@ -1,7 +1,7 @@
 """SQLite 存储层：每线程独立连接（WAL 模式）+ 写锁。
 
-- 写路径（录入 / 复测 / 确认）在 write_lock 内以 BEGIN IMMEDIATE 开启单事务，
-  保证整组占用与快照写入的原子性；
+- 写路径（录入 / 复测 / 确认 / 隔离 / 建批）在 write_lock 内以 BEGIN IMMEDIATE 开启单事务，
+  保证整组占用、快照写入与批次独占归属的原子性；
 - 每个请求线程使用自己的连接，读请求因此只能看到**已提交**的数据：
   确认事务中途写入的组记录、检测快照与临时占用对其他请求不可见，
   提交成功的瞬间整组一次性可见，回滚的确认对外不留任何痕迹；
@@ -52,6 +52,21 @@ CREATE TABLE IF NOT EXISTS isolations (
     created_at TEXT NOT NULL
 );
 
+-- 交付批次：2~4 个同体系已确认组独占归属，成员关系固定
+CREATE TABLE IF NOT EXISTS batches (
+    batch_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    chemistry  TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+-- 批次成员：group_id 上的 UNIQUE 是独占归属的最终防线——
+-- 一个组最多属于一个批次，并发建批抢注同一组时由数据库拒绝第二个事务
+CREATE TABLE IF NOT EXISTS batch_groups (
+    batch_id INTEGER NOT NULL REFERENCES batches(batch_id),
+    group_id INTEGER NOT NULL UNIQUE REFERENCES groups(group_id),
+    PRIMARY KEY (batch_id, group_id)
+);
+
 CREATE TRIGGER IF NOT EXISTS trg_groups_no_update BEFORE UPDATE ON groups
 BEGIN SELECT RAISE(ABORT, 'groups are immutable'); END;
 CREATE TRIGGER IF NOT EXISTS trg_groups_no_delete BEFORE DELETE ON groups
@@ -64,6 +79,15 @@ CREATE TRIGGER IF NOT EXISTS trg_isolations_no_update BEFORE UPDATE ON isolation
 BEGIN SELECT RAISE(ABORT, 'isolations are immutable'); END;
 CREATE TRIGGER IF NOT EXISTS trg_isolations_no_delete BEFORE DELETE ON isolations
 BEGIN SELECT RAISE(ABORT, 'isolations are immutable'); END;
+-- 批次与批次成员关系一经提交即固定：不改写、不拆除（后续隔离只阻断，不改归属）
+CREATE TRIGGER IF NOT EXISTS trg_batches_no_update BEFORE UPDATE ON batches
+BEGIN SELECT RAISE(ABORT, 'batches are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_batches_no_delete BEFORE DELETE ON batches
+BEGIN SELECT RAISE(ABORT, 'batches are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_batch_groups_no_update BEFORE UPDATE ON batch_groups
+BEGIN SELECT RAISE(ABORT, 'batch membership is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_batch_groups_no_delete BEFORE DELETE ON batch_groups
+BEGIN SELECT RAISE(ABORT, 'batch membership is immutable'); END;
 """
 
 # 确认/写入路径上的互斥锁，配合 BEGIN IMMEDIATE 保证事务原子性

@@ -1,5 +1,10 @@
 """请求/响应模型。"""
+from typing import Annotated
+
 from pydantic import BaseModel, Field
+
+# 组号 / 批次号均为自增正整数
+PositiveInt = Annotated[int, Field(gt=0)]
 
 
 class CellCreate(BaseModel):
@@ -39,3 +44,9 @@ class ConfirmCell(BaseModel):
 
 class ConfirmRequest(BaseModel):
     cells: list[ConfirmCell] = Field(min_length=3, max_length=6)
+
+
+class BatchCreateRequest(BaseModel):
+    """交付批次登记：提交 2~4 个不重复的已确认组号。"""
+
+    group_ids: list[PositiveInt] = Field(min_length=2, max_length=4)

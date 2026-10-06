@@ -758,3 +758,310 @@ def test_revise_test_response_reads_one_committed_snapshot(client):
     assert cell["test_version"] == "T2"
     _assert_coherent_cell(cell)
 
+
+# ---------- 交付批次 ----------
+
+def _seed_four_groups(client):
+    """录入 12 节 LFP 并确认为 4 个三组，返回组号 [1, 2, 3, 4]。"""
+    for i in range(1, 13):
+        add_cell(client, f"C{i:03d}", capacity=100.0, resistance=2.0)
+    gids = []
+    for g in range(4):
+        ids = [f"C{i:03d}" for i in range(g * 3 + 1, g * 3 + 4)]
+        r = _confirm(client, ids)
+        assert r.status_code == 201, r.text
+        gids.append(r.json()["group_id"])
+    return gids
+
+
+def _create_batch(client, group_ids):
+    return client.post("/batches", json={"group_ids": group_ids})
+
+
+def test_create_batch_success_with_confirmed_snapshots(client):
+    gids = _seed_four_groups(client)
+    r = _create_batch(client, [gids[0], gids[1]])
+    assert r.status_code == 201, r.text
+    batch = r.json()
+    assert batch["batch_id"] == 1
+    assert batch["chemistry"] == "LFP"
+    assert batch["group_ids"] == gids[:2]
+    assert batch["deliverable"] is True
+    assert batch["blocked_groups"] == []
+    # 每个成员组带确认时的检测快照
+    assert [g["group_id"] for g in batch["groups"]] == gids[:2]
+    g1 = batch["groups"][0]
+    assert [c["cell_id"] for c in g1["cells"]] == ["C001", "C002", "C003"]
+    assert g1["blocked"] is False
+    # 列表与按号查询一致
+    assert client.get("/batches").json()["count"] == 1
+    assert client.get("/batches/1").json() == batch
+
+
+def test_batch_404_and_validation(client):
+    assert client.get("/batches/99").status_code == 404
+    _seed_four_groups(client)
+    # 2~4 个：1 个或 5 个 -> 422
+    assert _create_batch(client, [1]).status_code == 422
+    assert _create_batch(client, [1, 2, 3, 4, 5]).status_code == 422
+    # 组号必须为正整数
+    assert client.post("/batches", json={"group_ids": [0, 1]}).status_code == 422
+    # 重复组号 -> 422
+    r = _create_batch(client, [1, 1])
+    assert r.status_code == 422
+    assert "重复" in r.json()["detail"]
+    assert client.get("/batches").json()["count"] == 0
+
+
+def test_create_batch_missing_group_rejected_atomically(client):
+    gids = _seed_four_groups(client)
+    r = _create_batch(client, [gids[0], 99])
+    assert r.status_code == 409
+    assert "99" in r.json()["detail"]
+    # 整批拒绝：无批次、无部分归属
+    assert client.get("/batches").json()["count"] == 0
+    # 组 1 仍可用于后续建批
+    assert _create_batch(client, [gids[0], gids[1]]).status_code == 201
+
+
+def test_create_batch_blocked_group_rejected_atomically(client):
+    gids = _seed_four_groups(client)
+    # 组 2（C004-C006）内一节电芯在建批前被隔离 -> 整批拒绝
+    assert isolate(client, "C005", "建批前抽检不合格").status_code == 201
+    r = _create_batch(client, [gids[0], gids[1]])
+    assert r.status_code == 409
+    detail = r.json()["detail"]
+    assert gids[1] == 2 and "2" in detail and "C005" in detail
+    assert client.get("/batches").json()["count"] == 0
+    # 不影响未阻断组后续与其他组建批
+    assert _create_batch(client, [gids[0], gids[2]]).status_code == 201
+
+
+def test_create_batch_mixed_chemistry_rejected(client):
+    # 6 节 LFP -> 组 1、2；3 节 NCM -> 组 3
+    for i in range(1, 7):
+        add_cell(client, f"C{i:03d}", chemistry="LFP")
+    for i in range(1, 4):
+        add_cell(client, f"N{i:03d}", chemistry="NCM")
+    assert _confirm(client, ["C001", "C002", "C003"]).status_code == 201
+    assert _confirm(client, ["C004", "C005", "C006"]).status_code == 201
+    assert _confirm(client, ["N001", "N002", "N003"]).status_code == 201
+    r = _create_batch(client, [1, 3])
+    assert r.status_code == 409
+    assert "化学体系" in r.json()["detail"]
+    assert client.get("/batches").json()["count"] == 0
+
+
+def test_group_exclusive_ownership(client):
+    gids = _seed_four_groups(client)
+    assert _create_batch(client, [gids[0], gids[1]]).status_code == 201
+    # 不重叠的组可以另建批次
+    assert _create_batch(client, [gids[2], gids[3]]).status_code == 201
+    # 含已归属组（即使夹杂空闲组）-> 整批拒绝，不留部分归属
+    r = _create_batch(client, [gids[1], gids[2]])
+    assert r.status_code == 409
+    assert "其他批次" in r.json()["detail"]
+    assert client.get("/batches").json()["count"] == 2
+    b2 = client.get("/batches/2").json()
+    assert b2["group_ids"] == [3, 4]  # 批次 2 未被污染
+
+
+def test_later_isolation_blocks_batch_but_keeps_membership_and_snapshot(client):
+    gids = _seed_four_groups(client)
+    bid = _create_batch(client, [gids[0], gids[1]]).json()["batch_id"]
+    # 建批后隔离组 1 的 C002：整批转为不可交付，给出受影响组号/电芯/原因
+    assert isolate(client, "C002", "交付前复检漏液").status_code == 201
+    batch = client.get(f"/batches/{bid}").json()
+    assert batch["deliverable"] is False
+    assert [x["group_id"] for x in batch["blocked_groups"]] == [gids[0]]
+    blocked_cells = batch["blocked_groups"][0]["cells"]
+    assert [c["cell_id"] for c in blocked_cells] == ["C002"]
+    assert blocked_cells[0]["reason"] == "交付前复检漏液"
+    g1, g2 = batch["groups"]
+    assert g1["blocked"] is True and g2["blocked"] is False
+    # 成员关系固定、各组确认时原快照不改写
+    assert batch["group_ids"] == [1, 2]
+    c002 = next(c for c in g1["cells"] if c["cell_id"] == "C002")
+    assert c002["capacity"] == 100.0 and c002["test_version"] == "T1"
+    # 隔离批外组（组 3）不影响批次可交付性
+    assert isolate(client, "C008", "批外组问题").status_code == 201
+    batch = client.get(f"/batches/{bid}").json()
+    assert [x["group_id"] for x in batch["blocked_groups"]] == [1]
+
+    # 已阻断组不能再用于另建新批
+    r = _create_batch(client, [gids[0], gids[2]])
+    assert r.status_code == 409
+    # 列表查询同样反映阻断
+    listed = {b["batch_id"]: b for b in client.get("/batches").json()["batches"]}
+    assert listed[bid]["deliverable"] is False
+    assert listed[bid]["groups"][0]["cells"] == g1["cells"]
+
+
+def _begin_uncommitted_batch(conn, group_ids):
+    """在给定连接上模拟一个尚未提交的建批事务。"""
+    conn.execute("BEGIN IMMEDIATE")
+    conn.execute(
+        "INSERT INTO batches (chemistry, created_at)"
+        " VALUES ('LFP', '2026-10-06T00:00:00+00:00')")
+    bid = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+    for gid in group_ids:
+        conn.execute(
+            "INSERT INTO batch_groups (batch_id, group_id) VALUES (?, ?)", (bid, gid))
+    return bid
+
+
+def test_uncommitted_batch_invisible_to_other_requests(client):
+    gids = _seed_four_groups(client)
+    from app import db
+    bid = _begin_uncommitted_batch(db.get_conn(), [gids[0], gids[1]])
+    # 未提交：批次列表/按号查询/组的归属都不可见
+    assert client.get("/batches").json()["count"] == 0
+    assert client.get(f"/batches/{bid}").status_code == 404
+    # 未提交的归属不阻断另一请求以这些组建批（其写事务将等待 SQLite 写锁，
+    # 这里通过只读视角确认归属尚不可见）
+    assert client.get("/groups/1").json()["group_id"] == 1
+    # 提交后整批一次性可见
+    db.get_conn().commit()
+    body = client.get(f"/batches/{bid}").json()
+    assert body["group_ids"] == [1, 2]
+    assert client.get("/batches").json()["count"] == 1
+
+
+def test_rolled_back_batch_leaves_no_trace(client):
+    gids = _seed_four_groups(client)
+    from app import db
+    conn = db.get_conn()
+    bid = _begin_uncommitted_batch(conn, [gids[0], gids[1]])
+    conn.rollback()
+    assert client.get("/batches").json()["count"] == 0
+    assert client.get(f"/batches/{bid}").status_code == 404
+    # 回滚不留归属：相同成员可正常建批
+    assert _create_batch(client, [gids[0], gids[1]]).status_code == 201
+
+
+def test_batch_and_isolation_race_commit_order_decides(client):
+    """建批与隔离并发：以提交先后决定整批拒绝还是已建批次转阻断，查询不见半成品。"""
+    gids = _seed_four_groups(client)
+    from app.main import app
+    results = {}
+    broken = []
+
+    def do_batch():
+        with TestClient(app) as c:
+            results["batch"] = c.post(
+                "/batches", json={"group_ids": [gids[0], gids[1]]}).status_code
+
+    def do_isolate():
+        with TestClient(app) as c:
+            results["isolate"] = c.post(
+                "/cells/C002/isolate", json={"reason": "并发隔离"}).status_code
+            for _ in range(10):
+                for b in c.get("/batches").json()["batches"]:
+                    # 可见的批次必须成员完整，可交付结论与各组阻断标记自洽
+                    if len(b["groups"]) != len(b["group_ids"]):
+                        broken.append(b)
+                    blocked = {g["group_id"] for g in b["groups"] if g["blocked"]}
+                    listed = {x["group_id"] for x in b["blocked_groups"]}
+                    if blocked != listed:
+                        broken.append(b)
+                    if b["deliverable"] is not (len(blocked) == 0):
+                        broken.append(b)
+
+    threads = [threading.Thread(target=do_batch), threading.Thread(target=do_isolate)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not broken
+    assert results["isolate"] == 201
+    batches = client.get("/batches").json()["batches"]
+    if results["batch"] == 201:
+        # 建批先提交：批次产生，随后的隔离使其不可交付；成员关系与快照保留
+        assert len(batches) == 1
+        b = batches[0]
+        assert b["group_ids"] == [1, 2]
+        assert b["deliverable"] is False
+        assert [x["group_id"] for x in b["blocked_groups"]] == [1]
+        assert [c["cell_id"] for c in b["blocked_groups"][0]["cells"]] == ["C002"]
+        assert len(b["groups"][0]["cells"]) == 3
+    else:
+        # 隔离先提交：建批整批拒绝，无批次也无部分归属
+        assert results["batch"] == 409
+        assert batches == []
+
+
+def _commit_raw_isolation(path, cell_id="C002", reason="批次交错隔离"):
+    """写方线程：在独立连接上提交一条隔离。"""
+    import sqlite3
+    conn = sqlite3.connect(path, timeout=30)
+    conn.execute("BEGIN IMMEDIATE")
+    conn.execute(
+        "INSERT INTO isolations (cell_id, reason, created_at)"
+        " VALUES (?, ?, '2026-10-06T00:00:00+00:00')", (cell_id, reason))
+    conn.commit()
+    conn.close()
+
+
+def test_batch_query_reads_one_committed_snapshot(client):
+    """GET /batches/{id}：成员组快照与当前隔离影响取自同一已提交快照，
+    不允许一批之内组 1 反映隔离后、组 2 或整批结论反映隔离前的混合状态。"""
+    gids = _seed_four_groups(client)
+    bid = _create_batch(client, [gids[0], gids[1]]).json()["batch_id"]
+    from app import db
+    from app.main import get_batch
+    path = os.environ["DB_PATH"]
+
+    gate = {"inside": threading.Event(), "release": threading.Event()}
+    outcome = {}
+
+    def reader():
+        conn = db.get_conn()
+        seen = {"n": 0, "armed": False, "fired": False}
+
+        def trace(statement):
+            compact = statement.upper()
+            # 只在批次主表的读取上挂一次（排除 batch_groups）
+            if "FROM BATCHES" in compact and "BATCH_GROUPS" not in compact:
+                seen["n"] += 1
+                if seen["n"] == 1:
+                    seen["armed"] = True
+
+        def progress():
+            if seen["armed"] and not seen["fired"]:
+                seen["fired"] = True
+                seen["armed"] = False
+                gate["inside"].set()
+                gate["release"].wait(5)
+            return 0
+
+        conn.set_trace_callback(trace)
+        conn.set_progress_handler(progress, 1)
+        try:
+            outcome["batch"] = get_batch(bid)
+        finally:
+            conn.set_trace_callback(None)
+            conn.set_progress_handler(None, 0)
+
+    rt = threading.Thread(target=reader)
+    rt.start()
+    assert gate["inside"].wait(5)
+    _commit_raw_isolation(path, "C002")  # 隔离批次内组 1 的电芯
+    gate["release"].set()
+    rt.join(5)
+    assert not rt.is_alive()
+
+    b = outcome["batch"]
+    gmap = {g["group_id"]: g for g in b["groups"]}
+    if b["deliverable"]:
+        # 隔离前快照：整批与两组全部未阻断
+        assert b["blocked_groups"] == []
+        assert all(not g["blocked"] for g in b["groups"])
+    else:
+        # 隔离后快照：组 1 阻断（C002 + 原因），组 2 未阻断，结论自洽
+        assert [x["group_id"] for x in b["blocked_groups"]] == [gids[0]]
+        assert [c["cell_id"] for c in b["blocked_groups"][0]["cells"]] == ["C002"]
+        assert gmap[gids[0]]["blocked"] is True
+        assert gmap[gids[1]]["blocked"] is False
+
+

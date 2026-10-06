@@ -1,7 +1,9 @@
 # 退役电芯成组放行 API
 
 基于 FastAPI + SQLite 的退役电芯成组放行服务：录入待选电芯（最多 12 节），按串联成组
-约束预选最优组合，确认时在单个 SQLite 事务中原子占用整组并保存不可改写的检测快照。
+约束预选最优组合，确认时在单个 SQLite 事务中原子占用整组并保存不可改写的检测快照；
+之后可把 2～4 个**同化学体系、当前未阻断**的已确认组登记为可追溯的交付批次，事务内
+重查全部成员并独占归属，批次查询返回各组确认时快照与按当前隔离记录计算的整批可交付状态。
 
 ## 快速启动
 
@@ -50,6 +52,20 @@ python -m pytest tests/ -q
 - **快照不可改写**：`groups` / `group_cells` / `isolations` 表由触发器禁止
   UPDATE/DELETE，可按组编号 `GET /groups/{group_id}` 查询，后续检测修订与隔离
   不影响已确认组的快照内容。
+- **交付批次登记**：`POST /batches` 提交 2～4 个**不重复组号**，仅接收**同一化学
+  体系、当前未被隔离阻断、且尚未归属其他批次**的已确认组。建批在**一次 SQLite
+  事务**（`BEGIN IMMEDIATE`，与确认/隔离共用同一写路径）内重查全部成员：组不存在、
+  体系不一致、任一成员组当前已阻断、或已被另一批次独占占用，则**整批拒绝、回滚，
+  不产生批次也不留部分归属**。批次成员关系写入后即固定（`batches` /
+  `batch_groups` 表由触发器禁止 UPDATE/DELETE；`batch_groups.group_id` 上的
+  UNIQUE 约束是独占归属的最终防线）。
+- **批次查询**：`GET /batches` / `GET /batches/{batch_id}` 返回固定成员关系、
+  **各组确认时的检测快照**，以及根据**当前隔离记录**计算的整批可交付状态：
+  `deliverable: true/false`，不可交付时在 `blocked_groups` 中给出受影响的**组号、
+  电芯 ID 与隔离原因**。后续隔离会阻断已建批次（状态变为不可交付），但**不改写
+  成员关系和原快照**；隔离批外的组不影响本批次。建批与隔离交错时，以**提交先后**
+  决定是拒绝建批（隔离先提交）还是让已建批次转为阻断（建批先提交）；一次批次查询
+  内各成员组快照与阻断结论只反映**同一个已提交状态**。
 - **并发可见性**：每个请求使用各自线程的独立 SQLite 连接（WAL 模式），查询只能
   看到**已提交的完整快照**。确认/隔离事务提交前，其他请求看不到其中间状态；提交
   成功的瞬间整组（组记录 + 快照 + 占用）或隔离记录一次性可见，回滚则毫无痕迹。
@@ -76,6 +92,8 @@ python -m pytest tests/ -q
 | POST | `/preselect` | 预选成组（只读，排除已隔离电芯） |
 | POST | `/groups/confirm` | 确认候选（单事务重查版本/占用/隔离，原子占用 + 快照） |
 | GET | `/groups` / `/groups/{group_id}` | 查询已确认组：检测快照 + 当前阻断状态 |
+| POST | `/batches` | 登记交付批次（2～4 个同体系、未阻断、未归属的组，单事务独占归属） |
+| GET | `/batches` / `/batches/{batch_id}` | 查询批次：固定成员 + 各组确认快照 + 当前可交付状态 |
 
 ## 调用示例（curl）
 
@@ -204,7 +222,115 @@ curl -s http://localhost:8000/isolations
 - **复测不能解除隔离**：`PUT /cells/{id}/test` 只更新检测档案，隔离记录保持不变；
   隔离没有解除接口，数据库触发器禁止对隔离记录的 UPDATE/DELETE。
 
-### 6. 候选过期场景（确认前复测 → 整组拒绝）
+### 6. 登记交付批次（2～4 个已确认组，单事务独占归属）
+
+先确认若干个组（每组 3～6 节同体系电芯，见上例），再提交 2～4 个不重复组号：
+
+```bash
+# 组 1、2 已确认且同体系、未阻断、未归属 -> 201 建批成功
+curl -s -X POST http://localhost:8000/batches \
+  -H 'Content-Type: application/json' \
+  -d '{"group_ids":[1, 2]}'
+```
+
+成功响应：批次成员固定，返回各组确认时检测快照；当前无隔离时整批可交付：
+
+```json
+{
+  "batch_id": 1,
+  "chemistry": "LFP",
+  "created_at": "2026-10-06T03:00:00.000000+00:00",
+  "group_ids": [1, 2],
+  "deliverable": true,
+  "blocked_groups": [],
+  "groups": [
+    {
+      "group_id": 1,
+      "chemistry": "LFP",
+      "series_count": 4,
+      "limited_capacity": 97.0,
+      "created_at": "2026-10-06T02:30:00.000000+00:00",
+      "blocked": false,
+      "blocked_cells": [],
+      "cells": [
+        {"cell_id": "C001", "capacity": 100.0, "resistance": 2.1, "test_version": "T1"},
+        {"cell_id": "C002", "capacity": 99.0,  "resistance": 2.2, "test_version": "T1"}
+      ]
+    }
+  ]
+}
+```
+
+整批拒绝的各种情况（均为 `409`，事务回滚，不留部分归属）：
+
+```bash
+# 组不存在
+curl -s -X POST http://localhost:8000/batches -H 'Content-Type: application/json' \
+  -d '{"group_ids":[1, 99]}'
+# {"detail":"组不存在：[99]"}
+
+# 化学体系不一致（LFP 组 + NCM 组）
+curl -s -X POST http://localhost:8000/batches -H 'Content-Type: application/json' \
+  -d '{"group_ids":[1, 3]}'
+# {"detail":"批次只接收同一化学体系的组，体系不一致：['LFP', 'NCM']"}
+
+# 组已归属其他批次
+curl -s -X POST http://localhost:8000/batches -H 'Content-Type: application/json' \
+  -d '{"group_ids":[2, 3]}'
+# {"detail":"组已归属其他批次，整批拒绝：[{2: 1}]"}
+
+# 成员组当前已被隔离阻断（给出组号、电芯 ID 与原因）
+curl -s -X POST http://localhost:8000/batches -H 'Content-Type: application/json' \
+  -d '{"group_ids":[3, 4]}'
+# {"detail":"成员组当前已被隔离阻断，整批拒绝：[{'group_id': 3, 'cell_id': 'C008', 'reason': '抽检发现漏液'}]"}
+
+# 组号数量不在 2~4、或组号重复 -> 422
+curl -s -X POST http://localhost:8000/batches -H 'Content-Type: application/json' \
+  -d '{"group_ids":[1]}'
+curl -s -X POST http://localhost:8000/batches -H 'Content-Type: application/json' \
+  -d '{"group_ids":[1, 1]}'
+# {"detail":"组号列表中存在重复组号"}
+```
+
+### 7. 查询批次：成员快照 + 当前可交付状态
+
+```bash
+curl -s http://localhost:8000/batches          # 批次列表
+curl -s http://localhost:8000/batches/1        # 按批次号查询（不存在 -> 404）
+```
+
+建批后再隔离批次内的一节电芯（`POST /cells/C002/isolate`），成员关系与各组原快照
+**不变**，但整批转为不可交付，并给出受影响的组号、电芯 ID 与原因：
+
+```json
+{
+  "batch_id": 1,
+  "chemistry": "LFP",
+  "group_ids": [1, 2],
+  "deliverable": false,
+  "blocked_groups": [
+    {
+      "group_id": 1,
+      "cells": [
+        {"cell_id": "C002", "reason": "抽检发现漏液", "isolated_at": "2026-10-06T03:10:00.000000+00:00"}
+      ]
+    }
+  ],
+  "groups": ["...组成员与确认时检测快照保持不变，组 1 blocked=true、组 2 blocked=false..."]
+}
+```
+
+要点：
+
+- **成员关系固定**：隔离只改变 `deliverable` / `blocked_groups`（及组内
+  `blocked` / `blocked_cells`），不拆批、不改归属，且隔离批外的组不影响本批次；
+- **建批与隔离交错**：隔离先于建批提交 → 建批 `409` 整批拒绝；建批先提交 →
+  批次产生并随隔离转为不可交付。任何时刻查询都只见已提交的完整状态；
+- **同快照口径**：一次批次查询里各成员组快照与阻断结论来自同一只读事务
+  （同一已提交快照），不会出现组 1 已反映隔离、组 2/整批结论还停留在隔离前的
+  混合状态。建批事务未提交时，批次、成员归属对其他请求均不可见；回滚不留痕迹。
+
+### 8. 候选过期场景（确认前复测 → 整组拒绝）
 
 ```bash
 # 预选后、确认前对 C002 复测，检测版本变为 T2
@@ -226,7 +352,7 @@ curl -s -X POST http://localhost:8000/groups/confirm \
 已被别组抢先占用的电芯再次确认时同样返回 `409` 并整组拒绝。确认后对电芯的复测
 修订不会改变 `GET /groups/{group_id}` 返回的快照内容。
 
-### 7. 并发查询（确认事务与读取互不干扰）
+### 9. 并发查询（确认事务与读取互不干扰）
 
 确认事务提交前，其他请求看不到它的任何中间状态；提交成功的瞬间，整组
 （组记录、检测快照、电芯占用）对所有请求一次性可见：
@@ -261,7 +387,7 @@ wait
 - 读取与确认并发执行互不影响：读取永远拿到一致的已提交状态，确认事务照常
   原子提交或整组回滚。
 
-### 8. 同一快照口径：确认与隔离交错时不拼出不存在的状态
+### 10. 同一快照口径：确认与隔离交错时不拼出不存在的状态
 
 考虑这个交错：一次 `GET /cells`（或 `GET /cells/C001`）先读到 C001 的占用信息，
 此时另一请求**确认**含 C001 的组并提交、随后又**隔离** C001 并提交，读请求最后
@@ -311,10 +437,10 @@ kill $POLL
 
 ```
 app/
-  main.py       # FastAPI 路由：录入 / 复测 / 隔离 / 预选 / 确认 / 快照与阻断查询
+  main.py       # FastAPI 路由：录入 / 复测 / 隔离 / 预选 / 确认 / 组查询 / 批次登记与查询
   db.py         # 每线程 SQLite 连接（WAL）、schema、不可改写触发器、写锁
   selection.py  # 成组预选算法（穷举组合，最多 C(12,6)=924 种）
-  schemas.py    # Pydantic 请求模型（串联节数 3~6、隔离原因等校验）
+  schemas.py    # Pydantic 请求模型（串联节数 3~6、批次 2~4 组、隔离原因等校验）
 tests/test_api.py
 Dockerfile / docker-compose.yml
 ```
